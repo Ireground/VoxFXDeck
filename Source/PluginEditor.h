@@ -97,13 +97,14 @@ private:
     Knob pitch, formant, grit, amount, mix, output;
     CharacterGrid grid;
     ShapePanel shape;
-    juce::ToggleButton fxOn { "FX On" }, autoLevel { "Auto level" };
+    juce::ToggleButton fxOn { "FX On" }, autoLevel { "Auto level" }, midiOn { "MIDI keys" };
     std::vector<std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment>> buttonAttachments;
 
     juce::Rectangle<int> headerArea, knobArea, middleArea, bottomArea;
     juce::Rectangle<float> statusPill;
     juce::String status;
     bool statusWarn = false;
+    int lastNoteOns = 0, midiSeenTicks = 0;
     float sc = 1.0f;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VoxFXDeckEditor)

@@ -37,6 +37,7 @@ AudioProcessorValueTreeState::ParameterLayout VoxFXDeckProcessor::createLayout()
 
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::fxOn, 1 }, "FX On", true));
     p.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::autoLevel, 1 }, "Auto Level", true));
+    p.push_back (std::make_unique<AudioParameterBool> (ParameterID { ParamIDs::midiOn, 1 }, "Play With MIDI", false));
 
     return { p.begin(), p.end() };
 }
@@ -72,7 +73,7 @@ void VoxFXDeckProcessor::selectCharacter (int index)
     }
 }
 
-void VoxFXDeckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
+void VoxFXDeckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer& midi)
 {
     ScopedNoDenormals noDenormals;
     for (int ch = getTotalNumInputChannels(); ch < getTotalNumOutputChannels(); ++ch)
@@ -89,6 +90,18 @@ void VoxFXDeckProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
     st.outputDb  = getParam (ParamIDs::output);
     st.fxOn      = getParam (ParamIDs::fxOn) > 0.5f;
     st.autoLevel = getParam (ParamIDs::autoLevel) > 0.5f;
+    st.midiOn    = getParam (ParamIDs::midiOn) > 0.5f;
+
+    for (const auto meta : midi)
+    {
+        const auto msg = meta.getMessage();
+        const int pos = meta.samplePosition;
+        if (msg.isNoteOn())             engine.midiEvent (1, msg.getNoteNumber(), msg.getVelocity(), pos);
+        else if (msg.isNoteOff())       engine.midiEvent (0, msg.getNoteNumber(), 0, pos);
+        else if (msg.isPitchWheel())    engine.midiEvent (2, msg.getPitchWheelValue(), 0, pos);
+        else if (msg.isController())    engine.midiEvent (3, msg.getControllerNumber(), msg.getControllerValue(), pos);
+        else if (msg.isAllNotesOff() || msg.isAllSoundOff()) engine.midiEvent (3, 123, 0, pos);
+    }
 
     float* r = buffer.getNumChannels() > 1 ? buffer.getWritePointer (1) : nullptr;
     engine.process (buffer.getWritePointer (0), r, buffer.getNumSamples(), st, meters);

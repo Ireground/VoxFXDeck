@@ -2,13 +2,14 @@
 // VoxFXDeck voice engine (plain C++, no JUCE so it can be tested on its own).
 //
 // Signal flow (mono, the voice is summed to mono first):
-//   1. STFT analysis (Hann, 4x overlap)
+//   1. STFT analysis (Hann, 4x overlap) + pitch detection (YIN) of the voice
 //   2. spectral envelope (true-envelope via cepstrum) = the "formants" of the voice
 //   3. excitation = spectrum / envelope  -> pitch shifted with a phase vocoder
-//      (optional second "layer" voice, e.g. an octave down for demons)
-//   4. or: a synthetic carrier (buzz / whisper) instead of the voice's own excitation (robot, ghost)
+//      (optional hard-tune snapping, optional second "layer" voice)
+//   4. or: a synthetic carrier (vocoder buzz / whisper) instead of the voice's own excitation.
+//      The carrier plays a fixed note, follows your voice, adds harmonies, or plays MIDI notes.
 //   5. envelope stretched up/down = formant shift, re-applied to the excitation
-//   6. time-domain colour: growl, ring mod, metal comb, drive, bit crush, filters, nasal peak, echo
+//   6. time-domain colour: growl, ring mod, metal comb, drive, bit crush, filters, nasal peak, echo, stereo chorus
 //   7. auto level + dry/wet mix (dry is delayed by the STFT latency so they stay in phase)
 
 #include <vector>
@@ -25,6 +26,10 @@ constexpr float pi = 3.14159265358979f;
 constexpr float twoPi = 6.28318530717959f;
 constexpr int numEnvPoints = 96;
 constexpr float envLoHz = 70.0f, envHiHz = 12000.0f;
+constexpr int maxNotes = 8;
+
+// carrier modes
+enum { fixedNote = 0, followVoice = 1, harmony = 2 };
 
 //==============================================================================
 struct Character
@@ -42,26 +47,39 @@ struct Character
     float peakHz, peakDb;          // nasal / body resonance
     float combHz, combFb;          // metallic resonance
     float echoMs, echoFb, echoMix;
+    float tilt = 0;                // carrier darkness (0 = bright buzz)
+    float chorus = 0;              // stereo ensemble
+    float hardTune = 0;            // snap the voice's pitch to notes
+    int mode = fixedNote;          // what the carrier plays without MIDI
+    int midi = 0;                  // 1 = can be played with MIDI notes
 };
 
-//                 name        tag          pitch form  layer lvl   synth noise vibHz vibSt ringHz ring  grHz  growl drive crush  hp     lp      pkHz   pkDb combHz fb    echoMs fb    mix
+//                 name         tag         pitch form  layer lvl   synth noise vibHz vibSt ringHz ring  grHz  growl drive  crush  hp    lp      pkHz   pkDb combHz fb    echoMs fb    mix     tilt chorus tune mode         midi
 inline const Character characters[] = {
-    { "Robot",    "MACHINE",    0,    0,    0,   0,    1,    0.06f, 0,  0,     0,    0,    0,    0,    0.15f, 0.10f, 120,  9000,   1200,  2,   0,    0,     0,    0,    0    },
-    { "Cyborg",   "MACHINE",    0,   -1,    0,   0,    0,    0,     0,  0,     60,   0.55f,0,    0,    0.25f, 0.05f, 150,  8000,   2000,  3,   180,  0.55f, 0,    0,    0    },
-    { "Alien",    "SCI-FI",     2,   -5,    0,   0,    0,    0,     7,  0.6f,  420,  0.30f,0,    0,    0.10f, 0,     100,  10000,  0,     0,   0,    0,     90,   0.30f,0.20f},
-    { "Radio",    "SCI-FI",     0,    0,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0.50f, 0.35f, 450,  3200,   1500,  4,   0,    0,     0,    0,    0    },
-    { "Monster",  "CREATURE",  -7,   -5,  -12,  0.35f, 0,    0,     0,  0,     0,    0,    45,   0.60f,0.50f, 0,     40,   7000,   250,   3,   0,    0,     0,    0,    0    },
-    { "Demon",    "CREATURE",  -5,   -3,  -12,  0.70f, 0,    0,     0,  0,     0,    0,    30,   0.35f,0.45f, 0,     30,   9000,   300,   4,   0,    0,     70,   0.40f,0.20f},
-    { "Giant",    "CREATURE", -12,   -6,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0.10f, 0,     30,   9000,   150,   3,   0,    0,     120,  0.25f,0.15f},
-    { "Goblin",   "CREATURE",   4,    5,    0,   0,    0,    0,     0,  0,     0,    0,    55,   0.25f,0.30f, 0,     120,  10000,  1800,  6,   0,    0,     0,    0,    0    },
-    { "Ghost",    "SPOOKY",     2,    1,    0,   0,    1,    1,     4,  0.2f,  0,    0,    0,    0,    0,     0,     250,  7000,   0,     0,   0,    0,     260,  0.55f,0.45f},
-    { "Zombie",   "SPOOKY",    -4,   -2,    0,   0,    0.35f,1,     0,  0,     0,    0,    22,   0.70f,0.40f, 0,     60,   5000,   0,     0,   0,    0,     0,    0,    0    },
-    { "Chipmunk", "ANIMAL",    12,    7,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0,     0,     100,  16000,  0,     0,   0,    0,     0,    0,    0    },
-    { "Duck",     "ANIMAL",     5,    9,    0,   0,    0,    0,     0,  0,     0,    0,    90,   0.45f,0.45f, 0,     400,  10000,  1600,  9,   0,    0,     0,    0,    0    },
-    { "Cat",      "ANIMAL",    12,    5,    0,   0,    0,    0,     6,  0.35f, 0,    0,    0,    0,    0.10f, 0,     300,  12000,  2500,  5,   0,    0,     0,    0,    0    },
-    { "Dog",      "ANIMAL",    -2,   -3,    0,   0,    0,    0,     0,  0,     0,    0,    35,   0.55f,0.55f, 0,     120,  6000,   700,   5,   0,    0,     0,    0,    0    },
-    { "Elephant", "ANIMAL",     7,   -3,   -5,  0.40f, 0,    0,     5,  0.3f,  0,    0,    0,    0,    0.70f, 0,     200,  6000,   1100,  8,   0,    0,     0,    0,    0    },
-    { "Insect",   "ANIMAL",    12,   12,    0,   0,    0,    0,     12, 0.4f,  220,  0.60f,0,    0,    0.10f, 0,     800,  14000,  0,     0,   0,    0,     0,    0,    0    },
+    // row 1: vocoders
+    { "Robot",     "MACHINE",    0,    0,    0,   0,    1,    0.06f, 0,  0,     0,    0,    0,    0,    0.15f, 0.10f, 120,  9000,   1200,  2,   0,    0,     0,    0,    0,      0,    0,    0,   fixedNote,   1 },
+    { "Talkbox",   "VOCODER",    0,    0,    0,   0,    1,    0.04f, 0,  0,     0,    0,    0,    0,    0.35f, 0,     100,  10000,  900,   3,   0,    0,     0,    0,    0,      0.4f, 0.15f,0,   followVoice, 1 },
+    { "Vocoder",   "VOCODER",    0,    0,    0,   0,    1,    0.10f, 0,  0,     0,    0,    0,    0,    0.05f, 0,     140,  11000,  3000,  3,   0,    0,     0,    0,    0,      0,    0.6f, 0,   followVoice, 1 },
+    { "Prism",     "VOCODER",    0,    0,    0,   0,    0.7f, 0.05f, 0,  0,     0,    0,    0,    0,    0,     0,     90,   14000,  0,     0,   0,    0,     140,  0.2f, 0.1f,   0.1f, 0.5f, 1,   harmony,     1 },
+    { "Hard Tune", "TUNE",       0,    0,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0,     0,     60,   18000,  3500,  2,   0,    0,     0,    0,    0,      0,    0.1f, 1,   fixedNote,   1 },
+    // row 2
+    { "Cyborg",    "MACHINE",    0,   -1,    0,   0,    0,    0,     0,  0,     60,   0.55f,0,    0,    0.25f, 0.05f, 150,  8000,   2000,  3,   180,  0.55f, 0,    0,    0 },
+    { "Alien",     "SCI-FI",     2,   -5,    0,   0,    0,    0,     7,  0.6f,  420,  0.30f,0,    0,    0.10f, 0,     100,  10000,  0,     0,   0,    0,     90,   0.30f,0.20f },
+    { "Radio",     "SCI-FI",     0,    0,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0.50f, 0.35f, 450,  3200,   1500,  4,   0,    0,     0,    0,    0 },
+    { "Ghost",     "SPOOKY",     2,    1,    0,   0,    1,    1,     4,  0.2f,  0,    0,    0,    0,    0,     0,     250,  7000,   0,     0,   0,    0,     260,  0.55f,0.45f,  0,    0.3f },
+    { "Zombie",    "SPOOKY",    -4,   -2,    0,   0,    0.35f,1,     0,  0,     0,    0,    22,   0.70f,0.40f, 0,     60,   5000,   0,     0,   0,    0,     0,    0,    0 },
+    // row 3
+    { "Monster",   "CREATURE",  -7,   -5,  -12,  0.35f, 0,    0,     0,  0,     0,    0,    45,   0.60f,0.50f, 0,     40,   7000,   250,   3,   0,    0,     0,    0,    0 },
+    { "Demon",     "CREATURE",  -5,   -3,  -12,  0.70f, 0,    0,     0,  0,     0,    0,    30,   0.35f,0.45f, 0,     30,   9000,   300,   4,   0,    0,     70,   0.40f,0.20f },
+    { "Giant",     "CREATURE", -12,   -6,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0.10f, 0,     30,   9000,   150,   3,   0,    0,     120,  0.25f,0.15f },
+    { "Goblin",    "CREATURE",   4,    5,    0,   0,    0,    0,     0,  0,     0,    0,    55,   0.25f,0.30f, 0,     120,  10000,  1800,  6,   0,    0,     0,    0,    0 },
+    { "Chipmunk",  "ANIMAL",    12,    7,    0,   0,    0,    0,     0,  0,     0,    0,    0,    0,    0,     0,     100,  16000,  0,     0,   0,    0,     0,    0,    0 },
+    // row 4
+    { "Duck",      "ANIMAL",     5,    9,    0,   0,    0,    0,     0,  0,     0,    0,    90,   0.45f,0.45f, 0,     400,  10000,  1600,  9,   0,    0,     0,    0,    0 },
+    { "Cat",       "ANIMAL",    12,    5,    0,   0,    0,    0,     6,  0.35f, 0,    0,    0,    0,    0.10f, 0,     300,  12000,  2500,  5,   0,    0,     0,    0,    0 },
+    { "Dog",       "ANIMAL",    -2,   -3,    0,   0,    0,    0,     0,  0,     0,    0,    35,   0.55f,0.55f, 0,     120,  6000,   700,   5,   0,    0,     0,    0,    0 },
+    { "Elephant",  "ANIMAL",     7,   -3,   -5,  0.40f, 0,    0,     5,  0.3f,  0,    0,    0,    0,    0.70f, 0,     200,  6000,   1100,  8,   0,    0,     0,    0,    0 },
+    { "Insect",    "ANIMAL",    12,   12,    0,   0,    0,    0,     12, 0.4f,  220,  0.60f,0,    0,    0.10f, 0,     800,  14000,  0,     0,   0,    0,     0,    0,    0 },
 };
 constexpr int numCharacters = (int) (sizeof (characters) / sizeof (characters[0]));
 
@@ -77,14 +95,20 @@ struct Settings
     float outputDb = 0.0f;
     bool fxOn = true;
     bool autoLevel = true;
+    bool midiOn = false;      // play the vocoder characters with MIDI notes
 };
+
+// what is making the sound (for the display)
+enum Source { srcVoice = 0, srcRobot, srcFollow, srcHarmony, srcMidi, srcWhisper, srcTuned, srcMidiTuned };
 
 struct Meters
 {
     std::atomic<float> inDb { -100.0f }, outDb { -100.0f };
     std::array<std::atomic<float>, numEnvPoints> inEnv {}, outEnv {};   // dB, relative
     std::atomic<float> pitchSt { 0.0f }, formantSt { 0.0f }, robotHz { 0.0f }, synth { 0.0f };
-    std::atomic<int> frames { 0 };
+    std::atomic<float> detectedHz { 0.0f }, carrierHz { 0.0f };
+    std::atomic<int> frames { 0 }, source { 0 }, noteOns { 0 }, numHeld { 0 };
+    std::array<std::atomic<int>, maxNotes> held {};
 };
 
 //==============================================================================
@@ -179,7 +203,9 @@ public:
         float pitch = 0, formant = 0, layerSemis = 0, layerLevel = 0, synth = 0, noise = 0,
               vibRate = 0, vibDepth = 0, ringHz = 100, ringMix = 0, growlHz = 40, growl = 0,
               drive = 0, crush = 0, hpHz = 20, lpHz = 20000, peakHz = 1000, peakDb = 0,
-              combHz = 200, combFb = 0, echoMs = 100, echoFb = 0, echoMix = 0, robotHz = 130.8f;
+              combHz = 200, combFb = 0, echoMs = 100, echoFb = 0, echoMix = 0, robotHz = 130.8f,
+              tilt = 0, chorus = 0, hardTune = 0;
+        int mode = fixedNote, midi = 0;
     };
 
     void prepare (double sampleRate, int /*maxBlock*/)
@@ -191,6 +217,7 @@ public:
         latency = N - hop;      // fifo bookkeeping
         fullLatency = N;        // what the host sees: wet output lags the input by one full frame
         fft.init (N);
+        fftAc.init (2 * N);
 
         win.assign ((size_t) N, 0.0f);
         double sumW2 = 0;
@@ -209,15 +236,16 @@ public:
         z (synMag, half + 1); z (synFreq, half + 1); z (synMag2, half + 1); z (synFreq2, half + 1);
         z (sumPhase, half + 1); z (sumPhase2, half + 1); z (carPhase, half + 1);
         z (carMag, half + 1); z (carFreq, half + 1);
+        z (prefix, N + 1); z (yinD, N); z (yinCmnd, N);
         buf.assign ((size_t) N, {});
         cep.assign ((size_t) N, {});
+        acBuf.assign ((size_t) (2 * N), {});
         outSpec.assign ((size_t) half + 1, {});
         tmpSpec.assign ((size_t) half + 1, {});
 
         lifter = std::clamp ((int) std::lround (sr * 0.0011f), 20, 200);
         rover = latency;
 
-        // envelope display bins
         for (int p = 0; p < numEnvPoints; ++p)
         {
             const float f = envLoHz * std::pow (envHiHz / envLoHz, (float) p / (float) (numEnvPoints - 1));
@@ -231,20 +259,43 @@ public:
 
         combBuf.assign ((size_t) (sr * 0.06f) + 4, 0.0f);
         echoBuf.assign ((size_t) (sr * 1.1f) + 4, 0.0f);
-        combPos = echoPos = 0;
+        chorusBuf.assign ((size_t) (sr * 0.05f) + 4, 0.0f);
+        combPos = echoPos = chorusPos = 0;
         hp.reset(); hp2.reset(); lp.reset(); lp2.reset(); pk.reset();
 
         live = Live();
         first = true;
-        vibPhase = growlPhase = ringPhase = 0;
+        vibPhase = growlPhase = ringPhase = chorusPhase = 0;
         holdCount = 0; holdValue = 0;
         inPow = wetPow = 0; autoGain = 1; fxMix = 1; outGain = 1;
+
+        // pitch / MIDI
+        f0 = 0; voiced = 0; tuneCorr = 0; lastSnapHz = 130.81f; noteGate = 1;
+        numCar = 0;
+        std::fill (std::begin (noteDown), std::end (noteDown), false);
+        std::fill (std::begin (noteSustained), std::end (noteSustained), false);
+        std::fill (std::begin (noteOrder), std::end (noteOrder), 0);
+        orderCounter = 0; sustain = false; bend = 0;
+        evRead = evWrite = 0;
+        sampleClock = 0;
     }
 
     int getLatency() const { return fullLatency; }
 
+    //==========================================================================
+    // MIDI: call before process() for every event in that block. type: 0 = note off, 1 = note on, 2 = pitch bend (0..16383), 3 = CC
+    void midiEvent (int type, int data1, int data2, int sampleOffset)
+    {
+        const int next = (evWrite + 1) % evSize;
+        if (next == evRead) return; // full
+        events[(size_t) evWrite] = { sampleClock + sampleOffset, type, data1, data2 };
+        evWrite = next;
+    }
+
     void process (float* L, float* R, int n, const Settings& s, Meters& m)
     {
+        settingsMidi = s.midiOn;
+        settingsPitch = s.pitch;
         updateLive (s, n);
         updateFilters();
 
@@ -259,9 +310,10 @@ public:
             const float xl = L[i], xr = R != nullptr ? R[i] : xl;
             const float mono = 0.5f * (xl + xr);
 
-            // ---- spectral stage (STFT with latency N - hop)
+            // ---- spectral stage (STFT with latency N)
             inFifo[(size_t) rover] = mono;
             float wet = outFifo[(size_t) (rover - latency)];
+            ++sampleClock;
             if (++rover >= N)
             {
                 rover = latency;
@@ -270,6 +322,8 @@ public:
 
             // ---- time-domain colour
             wet = colour (wet);
+            float wl = wet, wr = wet;
+            stereoChorus (wet, wl, wr);
 
             // ---- dry, delayed to line up with the wet signal
             const float dl = dryL[(size_t) dryPos], dr = dryR[(size_t) dryPos];
@@ -278,8 +332,9 @@ public:
             if (++dryPos >= dryDelay) dryPos = 0;
 
             // ---- auto level: wet as loud as the input
+            const float wm = 0.5f * (wl + wr);
             inPow += blockA * (mono * mono - inPow);
-            wetPow += blockA * (wet * wet - wetPow);
+            wetPow += blockA * (wm * wm - wetPow);
             if (s.autoLevel)
             {
                 if (inPow > 1.0e-9f && wetPow > 1.0e-12f)
@@ -289,18 +344,17 @@ public:
                 }
             }
             else autoGain += 0.002f * (1.0f - autoGain);
-            wet *= autoGain;
 
             fxMix += smoothA * (fxTarget - fxMix);
             outGain += smoothA * (outTarget - outGain);
             const float mix = s.mix * fxMix;
 
-            float ol = (dl * (1.0f - mix) + wet * mix) * outGain;
-            float orr = (dr * (1.0f - mix) + wet * mix) * outGain;
+            float ol = (dl * (1.0f - mix) + wl * autoGain * mix) * outGain;
+            float orr = (dr * (1.0f - mix) + wr * autoGain * mix) * outGain;
             if (! std::isfinite (ol) || ! std::isfinite (orr)) { ol = orr = 0.0f; resetState(); }
 
-            L[i] = ol;
-            if (R != nullptr) R[i] = orr;
+            if (R != nullptr) { L[i] = ol; R[i] = orr; }
+            else L[i] = 0.5f * (ol + orr);
             inPeak = std::max (inPeak, std::abs (mono));
             outPeak = std::max (outPeak, std::max (std::abs (ol), std::abs (orr)));
         }
@@ -313,6 +367,13 @@ public:
         m.formantSt.store (live.formant);
         m.robotHz.store (live.robotHz);
         m.synth.store (live.synth);
+        m.detectedHz.store (voiced > 0.5f ? f0 : 0.0f);
+
+        // held notes for the display
+        int count = 0;
+        for (int nn = 0; nn < 128 && count < maxNotes; ++nn)
+            if (noteDown[nn] || noteSustained[nn]) m.held[(size_t) count++].store (nn);
+        m.numHeld.store (count);
     }
 
     const Live& getLive() const { return live; }
@@ -349,6 +410,11 @@ private:
         t.echoMs = c.echoMs;
         t.echoFb = c.echoFb;
         t.echoMix = c.echoMix * a;
+        t.tilt = c.tilt;
+        t.chorus = c.chorus * a;
+        t.hardTune = c.hardTune * a;
+        t.mode = c.mode;
+        t.midi = c.midi;
         // robot note: C3 + pitch (the character's own pitch is part of its note)
         t.robotHz = 130.81f * std::pow (2.0f, (c.pitch + s.pitch) / 12.0f);
         return t;
@@ -377,6 +443,10 @@ private:
         smf (live.echoMs, t.echoMs);    sm (live.echoMix, t.echoMix);
         if (t.echoMix > 0.0f) sm (live.echoFb, t.echoFb); else live.echoFb *= (1.0f - a);
         smf (live.robotHz, t.robotHz);
+        sm (live.tilt, t.tilt);         sm (live.chorus, t.chorus);
+        sm (live.hardTune, t.hardTune);
+        live.mode = t.mode;
+        live.midi = t.midi;
     }
 
     static void fixZeroFreqs (Live& l)
@@ -404,6 +474,7 @@ private:
         std::fill (outFifo.begin(), outFifo.end(), 0.0f);
         std::fill (combBuf.begin(), combBuf.end(), 0.0f);
         std::fill (echoBuf.begin(), echoBuf.end(), 0.0f);
+        std::fill (chorusBuf.begin(), chorusBuf.end(), 0.0f);
         hp.reset(); hp2.reset(); lp.reset(); lp2.reset(); pk.reset();
         autoGain = 1.0f;
     }
@@ -415,6 +486,119 @@ private:
     }
 
     static float wrapPhase (float p) { return p - twoPi * std::floor ((p + pi) / twoPi); }
+    static float hzToMidi (float hz) { return 69.0f + 12.0f * std::log2 (hz / 440.0f); }
+    static float midiToHz (float m) { return 440.0f * std::pow (2.0f, (m - 69.0f) / 12.0f); }
+
+    //==========================================================================
+    // MIDI events are applied half a frame late, so they line up with the voice in the analysed frame
+    void applyMidiEvents()
+    {
+        const int64_t due = sampleClock - N / 2;
+        while (evRead != evWrite && events[(size_t) evRead].time <= due)
+        {
+            const auto e = events[(size_t) evRead];
+            evRead = (evRead + 1) % evSize;
+            if (e.type == 1 && e.d2 > 0)
+            {
+                noteDown[e.d1 & 127] = true;
+                noteSustained[e.d1 & 127] = false;
+                noteOrder[e.d1 & 127] = ++orderCounter;
+                noteOnsSeen++;
+            }
+            else if (e.type == 0 || e.type == 1)
+            {
+                noteDown[e.d1 & 127] = false;
+                if (sustain) noteSustained[e.d1 & 127] = true;
+            }
+            else if (e.type == 2) bend = ((float) e.d1 - 8192.0f) / 8192.0f * 2.0f;
+            else if (e.type == 3)
+            {
+                if (e.d1 == 64)
+                {
+                    sustain = e.d2 >= 64;
+                    if (! sustain) std::fill (std::begin (noteSustained), std::end (noteSustained), false);
+                }
+                else if (e.d1 == 123 || e.d1 == 120)
+                {
+                    std::fill (std::begin (noteDown), std::end (noteDown), false);
+                    std::fill (std::begin (noteSustained), std::end (noteSustained), false);
+                }
+            }
+        }
+    }
+
+    // the most recent notes held (up to maxNotes), as MIDI numbers
+    int heldNotes (int* out) const
+    {
+        int count = 0;
+        for (int nn = 0; nn < 128; ++nn)
+            if (noteDown[nn] || noteSustained[nn])
+            {
+                if (count < maxNotes) out[count++] = nn;
+                else
+                {
+                    // replace the oldest
+                    int oldest = 0;
+                    for (int j = 1; j < count; ++j) if (noteOrder[out[j]] < noteOrder[out[oldest]]) oldest = j;
+                    if (noteOrder[nn] > noteOrder[out[oldest]]) out[oldest] = nn;
+                }
+            }
+        return count;
+    }
+
+    //==========================================================================
+    // YIN pitch detection on the current frame. Sets f0 and voiced (0..1).
+    void detectPitch (float rmsDb)
+    {
+        const float* x = inFifo.data();
+        prefix[0] = 0;
+        for (int i = 0; i < N; ++i) prefix[(size_t) i + 1] = prefix[(size_t) i] + x[i] * x[i];
+        for (int i = 0; i < 2 * N; ++i) acBuf[(size_t) i] = { i < N ? x[i] : 0.0f, 0.0f };
+        fftAc.run (acBuf.data(), false);
+        for (int i = 0; i < 2 * N; ++i) acBuf[(size_t) i] = { std::norm (acBuf[(size_t) i]), 0.0f };
+        fftAc.run (acBuf.data(), true);
+        const float inv = 1.0f / (float) (2 * N);
+
+        const int minLag = std::max (2, (int) (sr / 1000.0f));
+        const int maxLag = std::min (N / 2 - 2, (int) (sr / 65.0f));
+        float run = 0;
+        yinCmnd[0] = 1;
+        for (int t = 1; t <= maxLag + 1; ++t)
+        {
+            const float r = acBuf[(size_t) t].real() * inv;
+            const float d = std::max (0.0f, prefix[(size_t) (N - t)] + (prefix[(size_t) N] - prefix[(size_t) t]) - 2.0f * r);
+            yinD[(size_t) t] = d;
+            run += d;
+            yinCmnd[(size_t) t] = run > 0 ? d * (float) t / run : 1.0f;
+        }
+
+        int best = -1;
+        for (int t = minLag; t <= maxLag; ++t)
+            if (yinCmnd[(size_t) t] < 0.15f)
+            {
+                while (t + 1 <= maxLag && yinCmnd[(size_t) t + 1] < yinCmnd[(size_t) t]) ++t;
+                best = t;
+                break;
+            }
+        if (best < 0)
+        {
+            float mn = 1.0f;
+            for (int t = minLag; t <= maxLag; ++t)
+                if (yinCmnd[(size_t) t] < mn) { mn = yinCmnd[(size_t) t]; best = t; }
+            if (mn > 0.3f) best = -1;
+        }
+
+        const bool isVoiced = best > 0 && rmsDb > -55.0f;
+        if (isVoiced)
+        {
+            float lag = (float) best;
+            const float a = yinCmnd[(size_t) best - 1], b = yinCmnd[(size_t) best], c = yinCmnd[(size_t) best + 1];
+            const float den = a - 2.0f * b + c;
+            if (std::abs (den) > 1.0e-9f) lag += std::clamp (0.5f * (a - c) / den, -0.5f, 0.5f);
+            f0 = sr / lag;
+        }
+        voiced += 0.6f * ((isVoiced ? 1.0f : 0.0f) - voiced);
+    }
 
     //==========================================================================
     float colour (float y)
@@ -482,6 +666,25 @@ private:
         return y;
     }
 
+    // wide ensemble (two modulated delays, left and right a quarter cycle apart)
+    void stereoChorus (float y, float& wl, float& wr)
+    {
+        chorusBuf[(size_t) chorusPos] = y;
+        if (live.chorus > 0.001f)
+        {
+            chorusPhase += 0.55f / sr;
+            chorusPhase -= std::floor (chorusPhase);
+            const float base = 0.012f * sr, depth = 0.004f * sr;
+            const float dL = base + depth * std::sin (twoPi * chorusPhase);
+            const float dR = base + depth * std::sin (twoPi * (chorusPhase + 0.25f));
+            const float cl = readFrac (chorusBuf, chorusPos, dL), cr = readFrac (chorusBuf, chorusPos, dR);
+            const float c = live.chorus;
+            wl = y * (1.0f - 0.4f * c) + cl * 0.8f * c;
+            wr = y * (1.0f - 0.4f * c) + cr * 0.8f * c;
+        }
+        if (++chorusPos >= (int) chorusBuf.size()) chorusPos = 0;
+    }
+
     static float readFrac (const std::vector<float>& b, int writePos, float delay)
     {
         const int size = (int) b.size();
@@ -536,8 +739,8 @@ private:
         }
     }
 
-    // adds polar(mag * env, phase accumulated from freq) * gain into dst, returns energy added
-    float synth (const std::vector<float>& mg, const std::vector<float>& fr, std::vector<float>& acc, float* energy)
+    // tmpSpec = polar(mag * newEnv, phase accumulated from freq); returns its energy
+    float synth (const std::vector<float>& mg, const std::vector<float>& fr, std::vector<float>& acc)
     {
         float e = 0.0f;
         for (int k = 0; k <= half; ++k)
@@ -547,7 +750,6 @@ private:
             tmpSpec[(size_t) k] = std::polar (a, acc[(size_t) k]);
             e += a * a;
         }
-        if (energy) *energy = e;
         return e;
     }
 
@@ -556,10 +758,33 @@ private:
         for (int k = 0; k <= half; ++k) outSpec[(size_t) k] += tmpSpec[(size_t) k] * gain;
     }
 
+    static float matchGain (float energyIn, float e) { return e > 1.0e-20f ? std::sqrt (energyIn / e) : 0.0f; }
+
+    // nearest note to the voice: from the MIDI notes held (octave-folded to stay in your range) or chromatic
+    float tuneTargetHz (const int* notes, int count) const
+    {
+        const float m = hzToMidi (f0);
+        if (count > 0)
+        {
+            float bestM = m, bestD = 1.0e9f;
+            for (int i = 0; i < count; ++i)
+            {
+                const float nm = (float) notes[i] + bend;
+                const float folded = nm + 12.0f * std::round ((m - nm) / 12.0f);
+                if (std::abs (folded - m) < bestD) { bestD = std::abs (folded - m); bestM = folded; }
+            }
+            return midiToHz (bestM);
+        }
+        return midiToHz (std::round (m));
+    }
+
     void processFrame (Meters& m)
     {
         const float expct = twoPi * (float) hop / (float) N;
         const float binHz = sr / (float) N;
+
+        applyMidiEvents();
+        if (noteOnsSeen > 0) { m.noteOns.fetch_add (noteOnsSeen); noteOnsSeen = 0; }
 
         // ---- analysis
         for (int k = 0; k < N; ++k) buf[(size_t) k] = { inFifo[(size_t) k] * win[(size_t) k], 0.0f };
@@ -582,12 +807,30 @@ private:
 
         computeEnvelope();
 
+        // ---- MIDI notes / pitch detection (only when the character needs them)
+        int notes[maxNotes];
+        const bool midiActive = settingsMidi && live.midi != 0;
+        const int numHeld = midiActive ? heldNotes (notes) : 0;
+        const bool needPitch = live.hardTune > 0.001f || (live.synth > 0.001f && live.midi != 0);
+        if (needPitch) detectPitch (rmsDb);
+        else voiced *= 0.5f;
+
+        // ---- hard tune: correction in semitones toward the nearest note
+        if (live.hardTune > 0.001f && voiced > 0.5f && f0 > 0.0f)
+        {
+            const float want = 12.0f * std::log2 (tuneTargetHz (notes, numHeld) / f0);
+            const float speed = std::clamp (live.hardTune * live.hardTune, 0.03f, 1.0f);
+            tuneCorr += speed * (want - tuneCorr);
+        }
+        else if (live.hardTune <= 0.001f) tuneCorr *= 0.8f;
+        const float corr = live.hardTune > 0.001f ? tuneCorr : tuneCorr * 0.0f;
+
         // ---- pitch: main voice ratio with vibrato
         vibPhase += twoPi * live.vibRate * (float) hop / sr;
         if (vibPhase > twoPi) vibPhase -= twoPi;
         const float vib = live.vibDepth * std::sin (vibPhase);
-        const float ratio = std::pow (2.0f, (live.pitch + vib) / 12.0f);
-        const float ratio2 = std::pow (2.0f, (live.pitch + live.layerSemis + vib) / 12.0f);
+        const float ratio = std::pow (2.0f, (live.pitch + corr + vib) / 12.0f);
+        const float ratio2 = std::pow (2.0f, (live.pitch + corr + live.layerSemis + vib) / 12.0f);
         const float fRatio = std::pow (2.0f, live.formant / 12.0f);
 
         // ---- excitation (flattened spectrum)
@@ -624,41 +867,91 @@ private:
             else
             {
                 shiftBins (work, freq, ratio, half, synMag, synFreq);
-                synth (synMag, synFreq, sumPhase, &e);
+                e = synth (synMag, synFreq, sumPhase);
             }
-            addTmp (voiceAmt * (e > 1.0e-20f ? std::sqrt (energyIn / e) : 0.0f));
+            addTmp (voiceAmt * matchGain (energyIn, e));
 
             if (live.layerLevel > 0.001f)
             {
                 shiftBins (work, freq, ratio2, half, synMag2, synFreq2);
-                synth (synMag2, synFreq2, sumPhase2, &e);
-                addTmp (voiceAmt * live.layerLevel * (e > 1.0e-20f ? std::sqrt (energyIn / e) : 0.0f));
+                e = synth (synMag2, synFreq2, sumPhase2);
+                addTmp (voiceAmt * live.layerLevel * matchGain (energyIn, e));
             }
         }
 
-        // ---- synthetic carrier (robot buzz / whisper), shaped by your formants
+        // ---- synthetic carrier (vocoder buzz / whisper), shaped by your formants
+        int source = srcVoice;
         if (live.synth > 0.001f)
         {
+            const float tr = std::pow (2.0f, settingsPitch / 12.0f);
+            float gateTarget = 1.0f;
+
+            if (midiActive)
+            {
+                source = srcMidi;
+                if (numHeld > 0)
+                {
+                    numCar = numHeld;
+                    for (int i = 0; i < numHeld; ++i) carHz[i] = midiToHz ((float) notes[i] + bend) * tr;
+                }
+                else gateTarget = 0.0f;   // no keys: silent (consonants still come through)
+            }
+            else if (live.mode == fixedNote || live.midi == 0)
+            {
+                source = live.noise > 0.5f ? srcWhisper : srcRobot;
+                numCar = 1;
+                carHz[0] = live.robotHz;
+            }
+            else
+            {
+                if (voiced > 0.5f && f0 > 0.0f) lastSnapHz = midiToHz (std::round (hzToMidi (f0)));
+                if (live.mode == followVoice)
+                {
+                    source = srcFollow;
+                    numCar = 1;
+                    carHz[0] = lastSnapHz * tr;
+                }
+                else
+                {
+                    source = srcHarmony;
+                    numCar = 4;
+                    carHz[0] = lastSnapHz * tr;
+                    carHz[1] = lastSnapHz * tr * 1.4983f;   // fifth
+                    carHz[2] = lastSnapHz * tr * 2.0f;      // octave up
+                    carHz[3] = lastSnapHz * tr * 0.5f;      // octave down
+                }
+            }
+            noteGate += (gateTarget > noteGate ? 0.7f : 0.35f) * (gateTarget - noteGate);
+            m.carrierHz.store (numCar > 0 ? carHz[0] : 0.0f);
+
+            // unvoiced sounds (s, t, k...) go through as whisper so the words stay clear
+            const float uvB = (needPitch && live.midi != 0) ? 0.85f * (1.0f - voiced) : 0.0f;
             const float gate = std::clamp ((rmsDb + 62.0f) / 14.0f, 0.0f, 1.0f);
-            const float buzzAmt = 1.0f - live.noise, noiseAmt = live.noise;
-            if (buzzAmt > 0.001f)
+            const float buzzW = (1.0f - live.noise) * (1.0f - uvB) * noteGate;
+            const float noiseW = live.noise * (1.0f - uvB) * noteGate + uvB;
+
+            if (buzzW > 0.001f && numCar > 0)
             {
                 std::fill (carMag.begin(), carMag.end(), 0.0f);
                 std::fill (carFreq.begin(), carFreq.end(), 0.0f);
-                const float f0 = live.robotHz * std::pow (2.0f, vib / 12.0f) / binHz;
-                for (int h = 1; ; ++h)
+                const float vibMul = std::pow (2.0f, vib / 12.0f);
+                for (int nIdx = 0; nIdx < numCar; ++nIdx)
                 {
-                    const float fb = f0 * (float) h;
-                    const int idx = (int) std::lround (fb);
-                    if (idx >= half) break;
-                    carMag[(size_t) idx] += 1.0f;
-                    carFreq[(size_t) idx] = fb;
+                    const float fb0 = carHz[nIdx] * vibMul / binHz;
+                    if (fb0 < 0.5f) continue;
+                    for (int h = 1; ; ++h)
+                    {
+                        const float fb = fb0 * (float) h;
+                        const int idx = (int) std::lround (fb);
+                        if (idx >= half) break;
+                        carMag[(size_t) idx] += live.tilt > 0.0f ? std::pow ((float) h, -live.tilt) : 1.0f;
+                        carFreq[(size_t) idx] = fb;
+                    }
                 }
-                float e = 0.0f;
-                synth (carMag, carFreq, carPhase, &e);
-                addTmp (live.synth * buzzAmt * gate * (e > 1.0e-20f ? std::sqrt (energyIn / e) : 0.0f));
+                const float e = synth (carMag, carFreq, carPhase);
+                addTmp (live.synth * buzzW * gate * matchGain (energyIn, e));
             }
-            if (noiseAmt > 0.001f)
+            if (noiseW > 0.001f)
             {
                 float e = 0.0f;
                 for (int k = 0; k <= half; ++k)
@@ -667,9 +960,12 @@ private:
                     tmpSpec[(size_t) k] = std::polar (a, pi * rnd());
                     e += a * a;
                 }
-                addTmp (live.synth * noiseAmt * gate * (e > 1.0e-20f ? std::sqrt (energyIn / e) : 0.0f));
+                addTmp (live.synth * noiseW * gate * matchGain (energyIn, e));
             }
         }
+        if (live.synth < 0.6f && live.hardTune > 0.3f)
+            source = (midiActive && numHeld > 0) ? srcMidiTuned : srcTuned;
+        m.source.store (source);
 
         // ---- synthesis + overlap-add
         outSpec[0] = { outSpec[0].real(), 0.0f };
@@ -686,7 +982,7 @@ private:
         if (rmsDb > -70.0f)
         {
             const float toDb = 20.0f / std::log (10.0f);
-            const float ref = std::log (std::sqrt (rmsRef)) ;
+            const float ref = std::log (std::sqrt (rmsRef));
             for (int p = 0; p < numEnvPoints; ++p)
             {
                 const float b = std::min (envBin[(size_t) p], (float) half);
@@ -706,25 +1002,44 @@ private:
     static constexpr int osamp = 4;
     int N = 2048, half = 1024, hop = 512, latency = 1536, fullLatency = 2048, rover = 1536, lifter = 48;
     float olaScale = 1.0f, rmsRef = 1.0f;
-    FFT fft;
+    FFT fft, fftAc;
     std::vector<float> win, inFifo, outFifo, outAccum;
     std::vector<float> mag, freq, lastPhase, logMag, envLog, work, newEnv;
     std::vector<float> synMag, synFreq, synMag2, synFreq2, sumPhase, sumPhase2, carPhase, carMag, carFreq;
-    std::vector<std::complex<float>> buf, cep, outSpec, tmpSpec;
+    std::vector<float> prefix, yinD, yinCmnd;
+    std::vector<std::complex<float>> buf, cep, acBuf, outSpec, tmpSpec;
     std::array<float, numEnvPoints> envBin {};
 
     std::vector<float> dryL, dryR;
     int dryDelay = 0, dryPos = 0;
-    std::vector<float> combBuf, echoBuf;
-    int combPos = 0, echoPos = 0;
+    std::vector<float> combBuf, echoBuf, chorusBuf;
+    int combPos = 0, echoPos = 0, chorusPos = 0;
     Biquad hp, hp2, lp, lp2, pk;
 
     Live live;
     bool first = true;
-    float vibPhase = 0, growlPhase = 0, growlJit = 0, ringPhase = 0;
+    float vibPhase = 0, growlPhase = 0, growlJit = 0, ringPhase = 0, chorusPhase = 0;
     int holdCount = 0;
     float holdValue = 0;
     float inPow = 0, wetPow = 0, autoGain = 1, fxMix = 1, outGain = 1;
     uint32_t seed = 0x1234567u;
+
+    // pitch + MIDI
+    float f0 = 0, voiced = 0, tuneCorr = 0, lastSnapHz = 130.81f, noteGate = 1;
+    float carHz[maxNotes] {};
+    int numCar = 0;
+    bool settingsMidi = false;
+    float settingsPitch = 0;
+    bool noteDown[128] {}, noteSustained[128] {};
+    uint32_t noteOrder[128] {};
+    uint32_t orderCounter = 0;
+    bool sustain = false;
+    float bend = 0;
+    int noteOnsSeen = 0;
+    struct Event { int64_t time; int type, d1, d2; };
+    static constexpr int evSize = 1024;
+    std::array<Event, evSize> events {};
+    int evRead = 0, evWrite = 0;
+    int64_t sampleClock = 0;
 };
 } // namespace vox

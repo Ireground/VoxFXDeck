@@ -5,7 +5,7 @@
 namespace ParamIDs
 {
     static const juce::String character = "character", amount = "amount", pitch = "pitch", formant = "formant",
-        grit = "grit", mix = "mix", output = "output", fxOn = "fxOn", autoLevel = "autoLevel";
+        grit = "grit", mix = "mix", output = "output", fxOn = "fxOn", autoLevel = "autoLevel", midiOn = "midiOn";
 }
 
 class VoxFXDeckProcessor : public juce::AudioProcessor
@@ -23,7 +23,7 @@ public:
     bool hasEditor() const override { return true; }
 
     const juce::String getName() const override { return "VoxFXDeck"; }
-    bool acceptsMidi() const override { return false; }
+    bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
     double getTailLengthSeconds() const override { return 2.0; }

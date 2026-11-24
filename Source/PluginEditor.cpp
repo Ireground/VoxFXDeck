@@ -9,16 +9,20 @@ Font uiFont (float h, bool bold)
 }
 
 static const char* const characterInfo[] = {
-    "Monotone robot: your words sung on one note. Set the note with PITCH.",
+    "Monotone robot: your words sung on one note (set it with PITCH). Plays chords with MIDI KEYS.",
+    "Daft Punk-style talkbox: a synth that sings your melody, snapped to notes. Plays chords with MIDI KEYS.",
+    "Classic wide vocoder that follows your melody. Turn on MIDI KEYS to play it with a keyboard.",
+    "Kanye / Bon Iver-style stacked harmonies built on your voice. With MIDI KEYS you play the chords.",
+    "T-Pain / Kanye hard Auto-Tune: snaps your voice to the nearest note. With MIDI KEYS it snaps to the notes you hold. Lower AMOUNT = softer.",
     "Half human, half machine: ring modulator and a metallic ring.",
     "Wobbly, warped alien voice with a sci-fi ring mod and a short echo.",
     "Old radio / walkie-talkie: narrow, crunchy and lo-fi.",
+    "Breathy ghost whisper with a long haunted echo.",
+    "Rotten, raspy, half-whispered zombie groan.",
     "Deep, growling monster with an extra voice an octave down.",
     "Demon: pitched down, an octave-down layer and a dark echo.",
     "Huge giant: an octave down with a big body.",
     "Small, nasty, nasal goblin.",
-    "Breathy ghost whisper with a long haunted echo.",
-    "Rotten, raspy, half-whispered zombie groan.",
     "The classic sped-up chipmunk voice.",
     "Raspy, nasal cartoon duck.",
     "High, wobbly, meow-ish cat.",
@@ -26,10 +30,11 @@ static const char* const characterInfo[] = {
     "Brassy, trumpeting elephant call.",
     "Tiny buzzing insect.",
 };
+static_assert (sizeof (characterInfo) / sizeof (characterInfo[0]) == (size_t) vox::numCharacters, "one description per character");
 
 static Colour tagColour (const String& tag)
 {
-    if (tag == "MACHINE")  return Pal::blue;
+    if (tag == "MACHINE" || tag == "VOCODER" || tag == "TUNE") return Pal::blue;
     if (tag == "SCI-FI")   return Colour (0xff4fd1c5);
     if (tag == "CREATURE") return Pal::gold;
     if (tag == "SPOOKY")   return Colour (0xffa99cf0);
@@ -200,7 +205,39 @@ static void drawGlyph (Graphics& g, const String& tag, Rectangle<float> r, Colou
     const float lw = jmax (1.2f, 1.6f * sc);
     g.setColour (col);
 
-    if (tag == "MACHINE")       // robot head
+    if (tag == "VOCODER")       // keyboard
+    {
+        auto kb = Rectangle<float> (s * 0.8f, s * 0.5f).withCentre (c);
+        g.drawRoundedRectangle (kb, s * 0.04f, lw);
+        for (int i = 1; i < 5; ++i)
+        {
+            const float x = kb.getX() + kb.getWidth() * (float) i / 5.0f;
+            g.drawLine (x, kb.getCentreY(), x, kb.getBottom(), lw * 0.8f);
+        }
+        for (int i : { 1, 2, 4 })
+        {
+            const float x = kb.getX() + kb.getWidth() * (float) i / 5.0f;
+            g.fillRect (x - s * 0.045f, kb.getY(), s * 0.09f, kb.getHeight() * 0.55f);
+        }
+        // little sound waves above
+        Path w;
+        w.startNewSubPath (c.x - s * 0.3f, kb.getY() - s * 0.12f);
+        for (int i = 1; i <= 6; ++i)
+            w.lineTo (c.x - s * 0.3f + s * 0.1f * (float) i, kb.getY() - s * ((i % 2) ? 0.2f : 0.08f));
+        g.strokePath (w, PathStrokeType (lw * 0.8f, PathStrokeType::curved, PathStrokeType::rounded));
+    }
+    else if (tag == "TUNE")     // music note
+    {
+        const float hx = c.x - s * 0.12f, hy = c.y + s * 0.22f;
+        g.fillEllipse (Rectangle<float> (s * 0.26f, s * 0.19f).withCentre ({ hx, hy }));
+        const float stemX = hx + s * 0.12f;
+        g.drawLine (stemX, hy, stemX, c.y - s * 0.34f, lw * 1.2f);
+        Path flag;
+        flag.startNewSubPath (stemX, c.y - s * 0.34f);
+        flag.quadraticTo (stemX + s * 0.28f, c.y - s * 0.2f, stemX + s * 0.16f, c.y + s * 0.02f);
+        g.strokePath (flag, PathStrokeType (lw * 1.2f, PathStrokeType::curved, PathStrokeType::rounded));
+    }
+    else if (tag == "MACHINE")  // robot head
     {
         auto head = Rectangle<float> (s * 0.64f, s * 0.5f).withCentre ({ c.x, c.y + s * 0.1f });
         g.drawRoundedRectangle (head, s * 0.08f, lw);
@@ -266,7 +303,7 @@ Rectangle<float> CharacterGrid::tileBounds (int index) const
     auto r = getLocalBounds().toFloat().reduced (12 * sc, 0);
     r.removeFromTop (32 * sc);
     r.removeFromBottom (12 * sc);
-    const int cols = 4, rows = (vox::numCharacters + cols - 1) / cols;
+    const int cols = 5, rows = (vox::numCharacters + cols - 1) / cols;
     const float gap = 8 * sc;
     const float w = (r.getWidth() - gap * (float) (cols - 1)) / (float) cols;
     const float h = (r.getHeight() - gap * (float) (rows - 1)) / (float) rows;
@@ -344,19 +381,19 @@ void CharacterGrid::paint (Graphics& g)
         g.setColour (tc.withAlpha (isSel ? 0.95f : 0.55f));
         g.fillRoundedRectangle (t.getX() + 6 * sc, t.getY() + 6 * sc, 3 * sc, t.getHeight() - 12 * sc, 1.5f * sc);
 
-        auto inner = t.reduced (14 * sc, 6 * sc);
-        auto icon = inner.removeFromLeft (jmin (inner.getHeight(), 32 * sc));
-        drawGlyph (g, tag, icon.reduced (2 * sc), tc.withAlpha (isSel ? 1.0f : 0.7f), sc);
-        inner.removeFromLeft (7 * sc);
+        auto inner = t.reduced (12 * sc, 6 * sc);
+        const float nameH = jmin (13.5f * sc, inner.getHeight() * 0.2f);
+        const float tagH = jmin (9.5f * sc, nameH * 0.75f);
+        auto tagR = inner.removeFromBottom (tagH + 2 * sc);
+        auto nameR = inner.removeFromBottom (nameH + 4 * sc);
+        drawGlyph (g, tag, inner.reduced (0, 3 * sc), tc.withAlpha (isSel ? 1.0f : 0.7f), sc);
 
-        const float nameH = jmin (14.0f * sc, inner.getHeight() * 0.42f);
-        auto nameR = inner.withHeight (inner.getHeight() * 0.58f);
         g.setColour (isSel ? Colours::white : Pal::text);
         g.setFont (uiFont (nameH, true));
-        g.drawFittedText (String (ch.name).toUpperCase(), nameR.toNearestInt(), Justification::bottomLeft, 1, 0.8f);
+        g.drawFittedText (String (ch.name).toUpperCase(), nameR.toNearestInt(), Justification::centred, 1, 0.75f);
         g.setColour (isSel ? tc : Pal::dim);
-        g.setFont (uiFont (jmin (10.0f * sc, nameH * 0.7f), true));
-        g.drawText (tag, inner.withTrimmedTop (inner.getHeight() * 0.6f), Justification::topLeft);
+        g.setFont (uiFont (tagH, true));
+        g.drawText (tag, tagR, Justification::centredTop);
     }
 }
 
@@ -487,16 +524,30 @@ void ShapePanel::paint (Graphics& g)
     const float synth = m.synth.load();
     const float pitchSt = m.pitchSt.load(), formantSt = m.formantSt.load();
 
-    String source;
-    const int ch = proc.getCharacter();
-    const float noise = vox::characters[ch].noise;
-    if (synth > 0.6f) source = noise > 0.5f ? "WHISPER" : "ROBOT  " + noteName (m.robotHz.load());
-    else if (synth > 0.05f) source = noise > 0.5f ? "VOICE + BREATH" : "VOICE + ROBOT";
-    else source = "YOUR VOICE";
+    const float detected = m.detectedHz.load();
+    const float carrier = m.carrierHz.load();
+    String held;
+    for (int i = 0, n = jmin (5, m.numHeld.load()); i < n; ++i)
+        held << (i > 0 ? " " : "") << noteName (440.0f * std::pow (2.0f, ((float) m.held[(size_t) i].load() - 69.0f) / 12.0f));
 
-    row ("SOUND SOURCE", source, synth > 0.6f ? Pal::gold : Pal::text);
-    row ("PITCH", synth > 0.6f ? String ("-") : st (pitchSt), std::abs (pitchSt) > 0.05f ? Pal::blue : Pal::text);
-    row ("FORMANT", st (formantSt), std::abs (formantSt) > 0.05f ? Pal::blue : Pal::text);
+    String source;
+    Colour sourceCol = Pal::gold;
+    switch (m.source.load())
+    {
+        case vox::srcRobot:     source = "ROBOT  " + noteName (m.robotHz.load()); break;
+        case vox::srcWhisper:   source = "WHISPER"; break;
+        case vox::srcFollow:    source = "SYNTH  " + noteName (carrier); break;
+        case vox::srcHarmony:   source = "HARMONIES ON " + noteName (carrier); break;
+        case vox::srcMidi:      source = held.isEmpty() ? String ("PLAY SOME KEYS") : "KEYS  " + held; break;
+        case vox::srcTuned:     source = detected > 0 ? "TUNED TO " + noteName (detected) : String ("TUNED"); break;
+        case vox::srcMidiTuned: source = "TUNED TO KEYS  " + held; break;
+        default:                source = synth > 0.05f ? "VOICE + SYNTH" : "YOUR VOICE"; sourceCol = Pal::text; break;
+    }
+
+    row ("SOUND SOURCE", source, sourceCol);
+    row ("YOUR NOTE", detected > 0 ? noteName (detected) + "  (" + String (roundToInt (detected)) + " Hz)" : String ("-"), Pal::text);
+    row ("PITCH / FORMANT", (synth > 0.6f ? String ("-") : st (pitchSt)) + "  /  " + st (formantSt),
+         (std::abs (pitchSt) > 0.05f || std::abs (formantSt) > 0.05f) ? Pal::blue : Pal::text);
     row ("LATENCY", String (proc.getLatencyMs(), 0) + " ms (auto-compensated)", Pal::dim);
 
     // level meters
@@ -548,12 +599,16 @@ VoxFXDeckEditor::VoxFXDeckEditor (VoxFXDeckProcessor& p)
     output.slider.setTooltip ("Output level.");
     fxOn.setTooltip ("Turn the effect on/off to compare.");
     autoLevel.setTooltip ("Keeps the effect as loud as your original voice, whatever character you pick.");
+    midiOn.setTooltip ("Play the top-row characters (Robot, Talkbox, Vocoder, Prism, Hard Tune) with MIDI notes. "
+                       "In REAPER: put a MIDI item on the vocal track, or send MIDI to it from another track.");
 
-    for (auto [btn, id] : { std::pair<ToggleButton*, const String*> { &fxOn, &ParamIDs::fxOn }, { &autoLevel, &ParamIDs::autoLevel } })
+    for (auto [btn, id] : { std::pair<ToggleButton*, const String*> { &fxOn, &ParamIDs::fxOn }, { &autoLevel, &ParamIDs::autoLevel }, { &midiOn, &ParamIDs::midiOn } })
     {
         addAndMakeVisible (btn);
         buttonAttachments.push_back (std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, *id, *btn));
     }
+
+    lastNoteOns = proc.meters.noteOns.load();
 
     // read the remembered size first: setResizeLimits() triggers resized(), which stores the size
     const int savedW = jlimit (780, 2400, proc.editorWidth), savedH = jlimit (500, 1540, proc.editorHeight);
@@ -577,7 +632,17 @@ void VoxFXDeckEditor::timerCallback()
     const auto& ch = vox::characters[proc.getCharacter()];
     String s = String (ch.name).toUpperCase() + "  |  " + ch.tag;
     bool warn = false;
+    const bool midiSwitch = proc.getParam (ParamIDs::midiOn) > 0.5f;
+    const int ons = proc.meters.noteOns.load();
+    const bool midiArriving = ons != lastNoteOns;
+    lastNoteOns = ons;
+    if (midiArriving) midiSeenTicks = 60;
+    else if (midiSeenTicks > 0) --midiSeenTicks;
+
     if (proc.getParam (ParamIDs::fxOn) < 0.5f) { s = "FX OFF"; warn = true; }
+    else if (midiSeenTicks > 0 && ! midiSwitch) { s = "MIDI IN: TURN ON MIDI KEYS"; warn = true; }
+    else if (midiSwitch && ch.midi == 0) { s = String (ch.name).toUpperCase() + "  |  IGNORES MIDI"; warn = true; }
+    else if (midiSwitch) s = String (ch.name).toUpperCase() + "  |  MIDI KEYS";
     if (s != status || warn != statusWarn) { status = s; statusWarn = warn; repaint (statusPill.toNearestInt().expanded (2)); }
 }
 
@@ -632,7 +697,7 @@ void VoxFXDeckEditor::resized()
     knobArea = r.removeFromBottom ((int) (132 * sc));
     middleArea = r.reduced ((int) (12 * sc), (int) (8 * sc));
 
-    const float pw = 200 * sc, ph = 22 * sc;
+    const float pw = 230 * sc, ph = 22 * sc;
     statusPill = { (float) headerArea.getRight() - 16 * sc - pw, (float) headerArea.getCentreY() - ph * 0.5f, pw, ph };
 
     auto m = middleArea;
@@ -651,7 +716,7 @@ void VoxFXDeckEditor::resized()
         kn->setBounds (k.removeFromLeft (small).reduced ((int) (4 * sc), (int) (6 * sc)));
 
     auto b = bottomArea.reduced ((int) (16 * sc), (int) (8 * sc));
-    for (auto* t : { &fxOn, &autoLevel })
+    for (auto* t : { &fxOn, &autoLevel, &midiOn })
     {
         t->setBounds (b.removeFromLeft ((int) (130 * sc)));
         b.removeFromLeft ((int) (6 * sc));
